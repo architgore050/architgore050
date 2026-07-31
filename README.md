@@ -1,354 +1,150 @@
-# IRobots-Devansh_Gaur
-Here's a quick and crisp README file for your hackathon project. It's designed to be immediately understandable, showcase the core innovation, and be demo-ready.
+# IRobots
 
----
+A robotic arm you talk to instead of program.
 
-# 🏭 FactoryReconfig AI: Prompt-Driven Robot Arm
+Most industrial arms are taught one job and then repeat it forever. Changing that job means someone rewrites the motion sequence, teaches every waypoint again, and takes the cell offline for a day. We think that is the wrong shape for the way small factories, labs, and workshops actually operate, where the task changes every week and nobody has a robotics engineer sitting around.
 
-> **Zero-shot factory reconfiguration through natural language prompting**
+IRobots is our attempt at a general controller that sits on top of any arm. You describe the job in plain language. A planning model breaks it into steps. A worker model turns each step into arm movements, watches what happens through a camera, and adjusts when reality does not match the plan. Swap the description, and the same hardware does a completely different job with no new code.
 
-[![Hackathon](https://img.shields.io/badge/Hackathon-48%20Hours-blue)](https://example.com)
-[![Python](https://img.shields.io/badge/Python-3.10+-green)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+This repository holds the work for our hackathon submission: firmware, mechanical design, vision pipeline, and the agent layer.
 
----
+## Why we think this matters
 
-## 🎯 What This Is
+The pitch is not "an arm that sorts blocks". Block sorting is just what fits on a table in a demo hall. The pitch is that the gap between "I know what I want done" and "the robot is doing it" collapses from days to a sentence.
 
-An **agentic robotic arm** that completely changes its behavior just by changing the system prompt. No code changes. No fine-tuning. Just natural language.
+Three places that gap actually hurts:
 
-**The demo**: "Sort red blocks to the left, blue to the right." → Robot sorts.  
-**Switch prompt**: "Stack objects in a tower, smallest on top." → Robot stacks.
+* **Adaptive assembly.** Short production runs and custom orders never justify the cost of reprogramming a cell. A prompt does.
+* **Places people should not be.** Space, deep sea, contaminated sites. You cannot send a technician out to teach waypoints again, and the round trip latency makes teleoperation painful. An arm that can plan and correct itself locally is worth a lot.
+* **Robotics without robotics engineers.** A biology lab, a repair shop, a school. The hardware is affordable now. The programming is what stops people.
 
-Same robot. Same code. Different factories. This is the future of manufacturing flexibility.
+## What makes our approach different
 
----
+* **Two model architecture.** A planner reasons about the goal and produces an ordered list of steps. A worker executes one step at a time and reports back what it observed. Splitting them keeps the reasoning model out of the tight control loop, which is where latency and hallucination hurt most.
+* **The model never invents coordinates.** Object positions come from the vision stack as real numbers. The language model chooses which object and what to do with it, and nothing else. This one rule kills the most common failure mode in language driven robotics.
+* **Portable across bodies.** Nothing in the agent layer assumes a specific arm. Kinematics live behind an interface, so a different arm means a new solver, not a new brain.
+* **It learns from the run.** State and outcomes are fed back to the planner, so a failed grasp becomes information rather than a stuck loop.
+* **No action model required.** We get task generality out of prompting and tool calling rather than a fine tuned vision language action model, which means no training run and no dataset to collect.
 
-## 🧠 The Architecture
+## Where the project stands right now
+
+We would rather tell you what actually runs than paint a picture we cannot demo. Current state:
+
+| Piece | Status | Notes |
+|---|---|---|
+| ESP32 camera node | Working | Streams MJPEG and stills over Wi Fi, tuned for the AI Thinker board |
+| Arm mechanical design | Working | SolidWorks assembly under `robotic arm schematics/` |
+| Inverse kinematics and servo control | In progress | Target is on device solving with software joint limits |
+| Vision and coordinate mapping | In progress | Detection plus a homography from pixels to table centimetres |
+| Planner and worker agents | In progress | Prompt design and tool schema |
+| Operator interface | Planned | Terminal interface first, browser interface after |
+
+The camera node is the part you can flash and see working in about ten minutes. Instructions are below.
+
+## How the system fits together
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        YOUR LAPTOP (AI)                        │
-│                                                                 │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐   │
-│   │  PERCEPTION  │    │  REASONING  │    │    EXECUTION    │   │
-│   │             │    │             │    │                 │   │
-│   │  YOLOv8    ──┼───→│  LLM (12B)  │    │  Coordinate    │   │
-│   │  OpenCV     │    │   + Vision  │    │   Mapping      │   │
-│   │             │    │             │    │                 │   │
-│   └─────────────┘    └─────────────┘    └────────┬────────┘   │
-│         ↑                   ↑                     │            │
-│         │                   │                     │            │
-└─────────┼───────────────────┼─────────────────────┼────────────┘
-          │                   │                     │
-          │                   │                     │ JSON over WiFi
-          │                   │                     │
-     ┌────┴────┐         ┌────┴────┐          ┌────┴────┐
-     │         │         │         │          │         │
-     │ Camera  │         │ Prompt  │          │  ESP32  │
-     │ (Top-   │         │ (User)  │          │  + 5×   │
-     │  down)  │         │         │          │ Servos  │
-     │         │         │         │          │         │
-     └─────────┘         └─────────┘          └─────────┘
+                 operator types a task
+                          │
+                          ▼
+             ┌────────────────────────┐
+             │     planner model      │   turns the task into ordered steps
+             └────────────────────────┘
+                          │
+   camera frames          ▼
+        │    ┌────────────────────────┐
+        └───▶│    perception layer    │   detection, then pixels to centimetres
+             └────────────────────────┘
+                          │
+                          ▼
+             ┌────────────────────────┐
+             │      worker model      │   picks the target, emits one tool call
+             └────────────────────────┘
+                          │
+                          ▼   JSON over Wi Fi
+             ┌────────────────────────┐
+             │     arm controller     │   inverse kinematics, joint limits, motion
+             └────────────────────────┘
+                          │
+                          ▼
+                   the arm moves, and
+                 the outcome is reported
+                     back to the planner
 ```
 
-**The magic**: The LLM never guesses coordinates. YOLO+OpenCV provides exact math. The LLM only reasons about *what* to do based on the prompt.
+The loop matters more than any single box. The worker acts, the camera sees the outcome, and the planner decides whether the step succeeded or needs another attempt. A longer walkthrough lives in [docs/architecture.md](docs/architecture.md).
 
----
+## Repository layout
 
-## 📦 Tech Stack
+```
+docs/                          project documentation
+pics/                          photos and captures for the writeup
+presentation/                  slides and demo material
+robotic arm schematics/        SolidWorks assembly for the arm
+src/
+  micro_controller/
+    esp32/                     arm side firmware
+    ardunio/                   auxiliary board sketches
+  vision-AI/
+    vison/                     ESP32 camera web server firmware
+    config/                    calibration and runtime configuration
+    simulation/                offline testing without hardware
+```
 
-| Layer | Technology | Why |
-|-------|------------|-----|
-| **Perception** | YOLOv8 + OpenCV | Fast, accurate object detection with pixel-perfect coordinates |
-| **Spatial Mapping** | OpenCV Homography | Maps camera pixels to real-world centimeters |
-| **Reasoning** | Gemma 4 12B (or Gemini 1.5 Flash via API) | SOTA VLM for visual reasoning and tool calling |
-| **Control** | Inverse Kinematics (Custom) | Converts (X,Y,Z) to 5 servo angles |
-| **Communication** | WebSocket over Wi-Fi | Real-time, reliable JSON command transport |
-| **Hardware** | ESP32 + 5× SG90 Servos | Cheap, accessible, and works out of the box |
+Directories holding a lone `temp.txt` are placeholders for work in flight. They exist so the structure is settled before the code lands.
 
----
+## Running the camera node
 
-## 🚀 Quick Start
+The ESP32 camera node is the piece that runs today. Full detail is in [docs/camera_server.md](docs/camera_server.md); the short version:
 
-### 1. Clone & Install
+1. Install the Arduino IDE and add the `esp32` board package from Espressif.
+2. Open `src/vision-AI/vison/CameraWebServer.ino`.
+3. Copy `camera_index.h` from the Arduino CameraWebServer example into the same folder. It is deliberately kept out of version control because it is a large generated blob, and the sketch will not compile without it.
+4. Put your network name and password at the top of the sketch.
+5. Select board **AI Thinker ESP32 CAM**, set PSRAM to enabled, and set the partition scheme to **Custom** so the `partitions.csv` in the sketch folder is used.
+6. Tie GPIO0 to ground, press reset, and upload. Remove the jumper and press reset again when it finishes.
+7. Open the serial monitor at 115200 baud and read off the address the board prints.
+
+Once it is up, put that address in a shell variable and pull a frame:
 
 ```bash
-git clone https://github.com/your-team/factory-reconfig-ai.git
-cd factory-reconfig-ai
-pip install -r requirements.txt
+export BOARD_IP=192.168.1.50
 ```
-
-### 2. Camera Calibration (5 minutes)
 
 ```bash
-python calibrate.py
-# Place 4 markers on the table
-# Measure their physical positions (cm)
-# Enter pixel coordinates when prompted
-# → Calibration complete!
+curl http://$BOARD_IP/capture --output frame.jpg
 ```
 
-### 3. Run the AI
+The browser interface is at `http://$BOARD_IP/`, and the raw MJPEG stream the vision pipeline consumes is at `http://$BOARD_IP:81/stream`.
 
-```bash
-# Option A: Local model (requires 16GB VRAM)
-ollama pull gemma-4-vl:12b
-python run.py --model gemma
+## Hardware
 
-# Option B: Cloud API (Gemini 1.5 Flash)
-export GEMINI_API_KEY="your-key"
-python run.py --model gemini
-```
+| Part | What we used | Count |
+|---|---|---|
+| Arm | Five joint design, SG90 class servos | 1 |
+| Camera board | ESP32 CAM, AI Thinker layout with OV2640 | 1 |
+| Arm controller | ESP32 development board | 1 |
+| Servo supply | 5V at 2A or better, separate from the boards | 1 |
+| USB serial adapter | For flashing the camera board | 1 |
+| Workspace | Flat surface with even lighting and four fixed calibration markers | 1 |
 
-### 4. Control the Arm
+One thing worth repeating because it has bitten us: do not run the servos off the ESP32 regulator. Give them their own supply and tie the grounds together. Wiring notes and the rest of the setup are in [docs/hardware.md](docs/hardware.md).
 
-```bash
-python run.py --prompt "Sort red blocks to the left bin"
-# The robot starts executing autonomously
-```
+## Documentation
 
----
+* [docs/README.md](docs/README.md) is the index.
+* [docs/architecture.md](docs/architecture.md) covers the design and the reasoning behind it.
+* [docs/hardware.md](docs/hardware.md) covers the build, wiring, and calibration.
+* [docs/camera_server.md](docs/camera_server.md) covers the camera firmware and its HTTP interface.
+* [docs/roadmap.md](docs/roadmap.md) covers what we are building next and in what order.
+* [Plan, TODO, Idea, Execution overview](<docs/Plan - TODO - Idea -  Execution overview.md>) is the original working notes, kept as written.
 
-## 🎮 How It Works (In 30 Seconds)
+## Team
 
-1. **Camera captures** the workspace
-2. **YOLOv8 detects** objects and outputs pixel coordinates
-3. **OpenCV converts** pixels → centimeters relative to robot base
-4. **LLM receives**: "Detected red block at X:15.2, Y:22.1. System prompt: [your factory instruction]"
-5. **LLM reasons** and outputs structured JSON tool call
-6. **WebSocket** sends JSON to ESP32
-7. **Inverse Kinematics** calculates 5 servo angles
-8. **Servos move**, completing the task
+Built by **IRobots**. The work is split across mechanical design, firmware, the vision and agent pipeline, and the demo itself, though at hackathon hours everyone ends up touching everything.
 
----
+## License
 
-## 🧪 Demo Scenarios (Switch Prompts. Watch It Adapt.)
+Released under the MIT License. See [LICENSE](LICENSE).
 
-### Scenario 1: Sorting Factory
-```
-System Prompt: "Sort red objects to the left bin and blue objects to the right bin."
-```
-Robot identifies colors and sorts accordingly.
-
-### Scenario 2: Stacking Factory
-```
-System Prompt: "Stack all objects in a tower, smallest on top."
-```
-Robot changes behavior immediately. No code changes.
-
-### Scenario 3: Inspection Factory
-```
-System Prompt: "Push any cylindrical objects off the table."
-```
-Robot now acts as a QC inspector.
-
----
-
-## 🔧 Configuration
-
-### Environment Variables
-
-```bash
-# For cloud-based reasoning
-GEMINI_API_KEY="your-api-key"
-OPENAI_API_KEY="your-api-key"
-
-# For Wi-Fi communication
-ESP32_IP="192.168.1.100"
-ESP32_PORT="8765"
-
-# For camera
-CAMERA_ID="0"
-CAMERA_WIDTH="640"
-CAMERA_HEIGHT="480"
-```
-
-### Calibration (Critical!)
-
-The 4-point calibration maps camera pixels to physical space:
-
-```python
-# Your calibration data (example)
-MARKERS = {
-    "top-left": (10.0, 10.0),    # cm from robot base
-    "top-right": (10.0, 30.0),
-    "bottom-left": (30.0, 10.0),
-    "bottom-right": (30.0, 30.0)
-}
-```
-
-**Why this matters**: Without calibration, the robot will miss objects by 5-15cm.
-
----
-
-## 📁 Project Structure
-
-```
-factory-reconfig-ai/
-├── src/
-│   ├── perception/
-│   │   ├── detector.py      # YOLOv8 object detection
-│   │   └── calibrate.py     # OpenCV homography
-│   ├── reasoning/
-│   │   ├── llm.py           # LLM interface (local/cloud)
-│   │   └── tools.py         # Tool definitions for function calling
-│   ├── execution/
-│   │   ├── websocket.py     # ESP32 communication
-│   │   └── ik.py            # Inverse Kinematics (if not on ESP32)
-│   └── run.py               # Main pipeline orchestrator
-├── hardware/
-│   └── esp32_firmware/
-│       ├── webSocketServer.ino
-│       └── ik_solver.ino
-├── config/
-│   └── calibration.json     # Saved camera calibration
-├── prompts/
-│   └── system_prompts.txt   # Pre-made factory prompts
-├── requirements.txt
-├── README.md
-└── demo.sh                  # One-command demo script
-```
-
----
-
-## 🛠️ Hardware Requirements
-
-| Component | Specification | Quantity |
-|-----------|--------------|----------|
-| Robot Arm | 5-DOF with SG90 servos | 1 |
-| ESP32 | Any variant with WiFi | 1 |
-| Camera | USB webcam (1080p) | 1 |
-| Power Supply | 5V 2A (for servos) | 1 |
-| Laptop | 16GB+ VRAM (for local) | 1 |
-| Markers | 4 distinct colored objects | 4 |
-
----
-
-## ⚠️ Critical Gotchas (Read This Before Demo)
-
-### 1. **Power the servos separately!**
-- ESP32 → USB power
-- Servos → Separate 5V 2A supply
-- Connect GNDs together
-
-### 2. **Calibrate before every demo session**
-- If the camera moves 1mm, the calibration breaks
-- Run `calibrate.py` first thing
-
-### 3. **Wi-Fi can fail**
-- Implemented watchdog timer on ESP32
-- If no command for 250ms, arm goes to safe state
-
-### 4. **Coordinate hallucination**
-- LLM never guesses coordinates
-- YOLO+OpenCV provides exact math
-- LLM only reasons about *which* object to target
-
-### 5. **Servos can strip gears**
-- Software limits prevent over-rotation
-- ESP32 code clamps servo angles
-
----
-
-## 🏆 Presenting the Demo
-
-### The Story Arc
-
-1. **"Look at this factory"** - Show the workspace, objects, arm
-2. **"Here's the system prompt"** - Show Prompt 1 on screen
-3. **"Watch it work"** - Robot executes task
-4. **"Now the factory redesigns"** - Change system prompt (visibly!)
-5. **"Watch it work differently"** - Robot executes new task
-6. **"No code changed. No fine-tuning. Just a new prompt."** - The mic drop
-
-### Presentation Tips
-
-- **Show the prompt** on a large screen during the demo
-- **Type the new prompt** live so judges see the change
-- **Use a timer** to show the prompt-to-action latency
-- **Have a backup video** of the simulation if Wi-Fi fails
-
----
-
-## 🔬 Technical Terms (For Your Presentation)
-
-| When to Use | What to Say |
-|-------------|-------------|
-| Describing the approach | "Decoupled Vision-Language-Action pipeline" |
-| Explaining the AI | "Tool-augmented LLM with structured output generation" |
-| Highlighting the innovation | "Zero-shot task generalization via prompt engineering" |
-| Describing the control | "Geometric inverse kinematics on a 5-DOF serial manipulator" |
-| Discussing the system | "Distributed cyber-physical system with networked control" |
-
----
-
-## 🚧 Troubleshooting
-
-### "The arm doesn't move"
-- Check power: Are servos getting 5V?
-- Check WiFi: Is ESP32 connected?
-- Check JSON: Is it valid? `{"x": 15.2, "y": 22.1, "z": 0.5}`
-
-### "The arm jitters"
-- Servo power supply is insufficient (use 2A+)
-- WiFi latency (increase interpolation on ESP32)
-
-### "The arm misses objects"
-- Calibration is off (re-run `calibrate.py`)
-- Camera moved (fix the mount)
-
-### "YOLO doesn't detect objects"
-- Object is too small (move camera closer)
-- Lighting is poor (add more light)
-
----
-
-## 📚 Further Reading
-
-- [YOLOv8 Documentation](https://docs.ultralytics.com/)
-- [OpenCV Perspective Transform](https://docs.opencv.org/4.x/da/d54/group__imgproc__transform.html)
-- [Gemma 4 Model Card](https://ai.google.dev/gemma)
-- [ESP32 WebSocket Server](https://randomnerdtutorials.com/esp32-websocket-server-arduino/)
-
----
-
-## 🤝 Team Roles
-
-| Role | Responsibility |
-|------|---------------|
-| **AI Lead (You)** | Pipeline orchestration, LLM integration, YOLO + OpenCV |
-| **Hardware Lead** | ESP32 firmware, Inverse Kinematics, servo control |
-| **Integration Lead** | Camera calibration, WebSocket comms, testing |
-| **Demo Lead** | Prompt engineering, presentation, backup planning |
-
----
-
-## 📞 Quick Commands
-
-```bash
-# Run the full pipeline with a specific prompt
-python run.py --prompt "Sort red to the left"
-
-# Calibrate the camera
-python calibrate.py --save calibration.json
-
-# Run just the AI (simulate without robot)
-python run.py --simulate --prompt "Stack objects"
-
-# Test WebSocket connection
-python test_websocket.py --ip 192.168.1.100 --port 8765
-
-# Record a demo video
-python run.py --record demo.mp4 --prompt "Sort red to the left"
-```
-
----
-
-## 🙏 Acknowledgments
-
-Built in 48 hours for [Hackathon Name] by [Team Name].
-
----
-
-**Made with ❤️ and way too much caffeine**
+The camera firmware under `src/vision-AI/vison/` derives from Espressif's CameraWebServer example and stays under Apache 2.0. Attribution is in [NOTICE](NOTICE).
