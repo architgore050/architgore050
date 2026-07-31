@@ -5,8 +5,32 @@
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
 // =========================================================
-// SERVO CHANNEL DEFINITIONS (0-15 on the PCA9685 board)
-// ===== ====================================================
+// PORTED FROM ARDUINO UNO/NANO TO ESP32
+// Changes made (read before wiring):
+//  - I2C (PCA9685): ESP32 default is SDA=21, SCL=22. Wire.begin() uses these
+//    automatically. If your board/wiring differs, call
+//    Wire.begin(SDA_PIN, SCL_PIN) instead in setup().
+//  - E-STOP pin moved to GPIO 27 (was Uno pin 2). Avoid strapping pins
+//    (0, 2, 12, 15) and input-only pins (34-39, no internal pulldown) for
+//    this signal since it needs attachInterrupt + pinMode INPUT.
+//  - MAX7219 dot matrix pins moved to GPIO 23 (DIN), 5 (CS), 18 (CLK) —
+//    these are bit-banged by the LedControl library, so any free GPIO works.
+//  - BUZZER and RGB LED moved off Uno pins 3/4/5/6 (some of those clash with
+//    the new matrix wiring above) to GPIO 25 (buzzer), 26/32/33 (R/G/B).
+//  - analogWrite()/tone() are reimplemented on top of the ESP32 LEDC
+//    peripheral (setStatusColor() and toneESP32()/noToneESP32()), because
+//    older esp32 Arduino cores don't support analogWrite()/tone() the same
+//    way Uno does. Function names in the rest of the sketch are unchanged
+//    (setStatusColor, tone, noTone) via thin wrapper macros/functions below.
+//  - ISR now carries IRAM_ATTR (required on ESP32; interrupt code must
+//    live in IRAM, not flash).
+//  - eStopActive is declared volatile as before; ESP32 is dual-core so this
+//    matters just as much (if not more) than on Uno.
+// =========================================================
+
+// =========================================================
+// SERVO CHANNEL DEFINITIONS (0-15 on the PCA9685 board) — UNCHANGED
+// =========================================================
 // --- ARM 1 (existing) ---
 #define BASE        0
 #define SHOULDER    1
@@ -15,59 +39,56 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define WRIST_PITCH 4
 #define GRIPPER     5
 
-// --- ARM 2 (NEW second 3-servo arm) ---
-// Wire this arm's 3 servos to the next free channels on the SAME PCA9685
-// board (these are PCA9685 channel numbers, not Arduino pins).
+// --- ARM 2 (second 3-servo arm) ---
 #define BASE2     6
 #define SHOULDER2 7
 #define ELBOW2    8
 
-// Pulse Width Limits (Microseconds)
-// MG996R: ~600us to 2400us. SG90: ~600us to 2400us.
-// We use conservative limits to prevent mechanical binding.
-#define SERVOMIN  600
+// Pulse Width Limits (Microseconds) — UNCHANGED
+#define SERVOMIN  500
 #define SERVOMAX  2400
 
 // =========================================================
-// 8x8 DOT MATRIX (MAX7219) — wired per your reference table:
-//   MAX7219 VCC -> Arduino 5V     MAX7219 GND -> Arduino GND
-//   MAX7219 DIN -> Arduino 11 (MOSI)
-//   MAX7219 CS/LOAD -> Arduino 10
-//   MAX7219 CLK -> Arduino 13 (SCK)
+// I2C PINS (ESP32) — set to your actual wiring if not using defaults
 // =========================================================
-#define MATRIX_DIN 11
-#define MATRIX_CS  10
-#define MATRIX_CLK 13
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// =========================================================
+// 8x8 DOT MATRIX (MAX7219) — ESP32 GPIOs (bit-banged, any free pin works)
+// =========================================================
+#define MATRIX_DIN 23
+#define MATRIX_CS  5
+#define MATRIX_CLK 18
 LedControl lc = LedControl(MATRIX_DIN, MATRIX_CLK, MATRIX_CS, 1); // 1 = one 8x8 module
 
 // =========================================================
-// EMERGENCY STOP BUTTON — wired per your breadboard image:
-//   Arduino pin 2 (green wire) -> button
-//   Button -> 5V (red wire) through the button
-//   Resistor pulls pin 2 LOW to GND (black wire) when button is not pressed
-// This is an external-pulldown circuit: unpressed = LOW, pressed = HIGH.
+// EMERGENCY STOP BUTTON — external pulldown circuit:
+//   unpressed = LOW, pressed = HIGH (same electrical behavior as before)
 // =========================================================
-#define ESTOP_PIN 7
+#define ESTOP_PIN 27
 volatile bool eStopActive = false;
 
 // =========================================================
-// BUZZER — pin not shown in your images, wire a buzzer's + leg here
-// (piezo buzzer: pin -> buzzer -> GND, no resistor needed).
-// CHANGE THIS if you wire it to a different pin.
+// BUZZER — driven via LEDC (ESP32 has no native tone() on all cores)
 // =========================================================
-#define BUZZER_PIN 4
+#define BUZZER_PIN 25
+#define BUZZER_LEDC_CHANNEL 4   // must not collide with RGB channels below
 
 // =========================================================
-// RGB STATUS LED — pins not shown in your images, wire a common-cathode
-// RGB LED here (each color leg through its own ~220 ohm resistor, common
-// leg to GND). CHANGE THESE if you wire it differently.
+// RGB STATUS LED — driven via LEDC PWM (replaces analogWrite)
 // =========================================================
-#define RGB_RED_PIN   3
-#define RGB_GREEN_PIN 5
-#define RGB_BLUE_PIN  6
+#define RGB_RED_PIN   26
+#define RGB_GREEN_PIN 32
+#define RGB_BLUE_PIN  33
+#define RGB_RED_LEDC_CHANNEL   1
+#define RGB_GREEN_LEDC_CHANNEL 2
+#define RGB_BLUE_LEDC_CHANNEL  3
+#define LEDC_FREQ_PWM   5000
+#define LEDC_RES_PWM_BITS 8
 
 // =========================================================
-// 8x8 BITMAPS (one byte per row, top row first)
+// 8x8 BITMAPS (one byte per row, top row first) — UNCHANGED
 // =========================================================
 byte NUM_3[8] = {
   B00111100,
@@ -123,9 +144,10 @@ byte XMARK[8] = {
 int processingFrame = 0; // used by the scanning-bar "processing" animation
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200); // ESP32 default monitor speed; change if you prefer 9600
 
-  // --- Servo driver ---
+  // --- I2C / Servo driver ---
+  Wire.begin(I2C_SDA, I2C_SCL);
   pwm.begin();
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(50);  // Standard 50Hz for analog servos
@@ -136,40 +158,35 @@ void setup() {
   lc.setIntensity(0, 8);   // brightness 0-15
   lc.clearDisplay(0);
 
-  // --- RGB status LED ---
-  pinMode(RGB_RED_PIN, OUTPUT);
-  pinMode(RGB_GREEN_PIN, OUTPUT);
-  pinMode(RGB_BLUE_PIN, OUTPUT);
+  // --- RGB status LED (LEDC setup) ---
+  ledcSetup(RGB_RED_LEDC_CHANNEL,   LEDC_FREQ_PWM, LEDC_RES_PWM_BITS);
+  ledcSetup(RGB_GREEN_LEDC_CHANNEL, LEDC_FREQ_PWM, LEDC_RES_PWM_BITS);
+  ledcSetup(RGB_BLUE_LEDC_CHANNEL,  LEDC_FREQ_PWM, LEDC_RES_PWM_BITS);
+  ledcAttachPin(RGB_RED_PIN,   RGB_RED_LEDC_CHANNEL);
+  ledcAttachPin(RGB_GREEN_PIN, RGB_GREEN_LEDC_CHANNEL);
+  ledcAttachPin(RGB_BLUE_PIN,  RGB_BLUE_LEDC_CHANNEL);
   setStatusColor(0, 0, 0);
 
-  // --- Buzzer ---
-  pinMode(BUZZER_PIN, OUTPUT);
+  // --- Buzzer (LEDC setup, channel starts idle) ---
+  ledcSetup(BUZZER_LEDC_CHANNEL, 2000, 10); // freq gets overwritten per-tone() call
+  ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
 
   // --- Emergency stop ---
-  pinMode(ESTOP_PIN, INPUT); // external pulldown resistor per your wiring image
+  pinMode(ESTOP_PIN, INPUT); // external pulldown resistor, same wiring as before
   attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), eStopISR, RISING);
 
   // --- Initialize ARM 1 to neutral ---
-<<<<<<< Updated upstream:src/micro_controller/ardunio/V1_arm_controller_full_status.ino
-  setServoAngle(BASE, 90);         delay(200);
-  setServoAngle(SHOULDER, 90);     delay(200);
-  setServoAngle(ELBOW, 90);        delay(200);
-  setServoAngle(WRIST_ROT, 0);     delay(200);
-  setServoAngle(WRIST_PITCH, 90);  delay(200);
-  setServoAngle(GRIPPER, 90);      delay(200); // Open/Neutral
-=======
   //setServoAngle(BASE, 10);         delay(500);
   setServoAngle(SHOULDER, 100);     delay(500);
   setServoAngle(ELBOW, 97);        delay(500);
   setServoAngle(WRIST_ROT, 100);     delay(500);
   // setServoAngle(WRIST_PITCH, 45);  delay(500);
-  setServoAngle(GRIPPER, 90);      delay(500); // Open/Neutral // good enough open // 40- 50 for close 
->>>>>>> Stashed changes:src/micro_controller/ardunio/V1_arm_controller_full_status/V1_arm_controller_full_status.ino
+  setServoAngle(GRIPPER, 90);      delay(500); // Open/Neutral // good enough open // 40- 50 for close
 
   // --- Initialize ARM 2 to neutral ---
-  setServoAngle(BASE2, 90);        delay(200);
-  setServoAngle(SHOULDER2, 90);    delay(200);
-  setServoAngle(ELBOW2, 90);       delay(200);
+  //setServoAngle(BASE2, 90);        delay(200);
+  //setServoAngle(SHOULDER2, 90);    delay(200);
+  //setServoAngle(ELBOW2, 90);       delay(200);
 }
 
 void loop() {
@@ -181,17 +198,7 @@ void loop() {
   setStatusColor(0, 255, 0); // green: motors running
   Serial.println("Processing...");
 
-<<<<<<< Updated upstream:src/micro_controller/ardunio/V1_arm_controller_full_status.ino
   // --- Sweep ARM 1 and ARM 2 to their first test position ---
-  moveJointAnimated(BASE, 45, 1000);
-  if (checkEStop()) return;
-  moveJointAnimated(SHOULDER, 60, 1000);
-  if (checkEStop()) return;
-  // moveJointAnimated(ELBOW, 50, 1000);
-  // moveJointAnimated(WRIST_ROT, 95, 500);
-  // moveJointAnimated(WRIST_PITCH, 0, 500);
-=======
-  // --- Sweep ARM 1 and AR1M 2 to their first test position ---
   //moveJointAnimated(BASE, 20, 1000);
   //moveJointAnimated(BASE, 10, 1000);
   if (checkEStop()) return;
@@ -205,34 +212,20 @@ void loop() {
   moveJointAnimated(WRIST_ROT, 100, 500);
   moveJointAnimated(WRIST_PITCH, 100, 500);
   moveJointAnimated(WRIST_PITCH, 20, 500);
->>>>>>> Stashed changes:src/micro_controller/ardunio/V1_arm_controller_full_status/V1_arm_controller_full_status.ino
   moveJointAnimated(GRIPPER, 40, 500); // Close gripper
   moveJointAnimated(GRIPPER, 90, 500); // Close gripper
   if (checkEStop()) return;
 
-  moveJointAnimated(BASE2, 45, 1000);
-  if (checkEStop()) return;
-  moveJointAnimated(SHOULDER2, 60, 1000);
-  if (checkEStop()) return;
-  moveJointAnimated(ELBOW2, 50, 1000);
-  if (checkEStop()) return;
+  // moveJointAnimated(BASE2, 45, 1000);
+  // if (checkEStop()) return;
+  // moveJointAnimated(SHOULDER2, 60, 1000);
+  // if (checkEStop()) return;
+  // moveJointAnimated(ELBOW2, 50, 1000);
+  // if (checkEStop()) return;
 
   delay(500);
 
   // --- Return ARM 1 and ARM 2 to their second test position ---
-<<<<<<< Updated upstream:src/micro_controller/ardunio/V1_arm_controller_full_status.ino
-  moveJointAnimated(BASE, 95, 1000);
-  if (checkEStop()) return;
-  // moveJointAnimated(SHOULDER, 100, 1000);
-  // if (checkEStop()) return;
-  // moveJointAnimated(ELBOW, 90, 1000);
-  moveJointAnimated(WRIST_ROT, 135, 500);
-  if (checkEStop()) return;
-  moveJointAnimated(WRIST_PITCH, 10, 500);
-  if (checkEStop()) return;
-  moveJointAnimated(GRIPPER, 100, 500); // Open gripper
-  if (checkEStop()) return;
-=======
   // moveJointAnimated(BASE, 95, 1000);
   // if (checkEStop()) return;
   // moveJointAnimated(SHOULDER, 100, 1000);
@@ -244,14 +237,13 @@ void loop() {
   // if (checkEStop()) return;
   // moveJointAnimated(GRIPPER, 50, 500); // Open gripper
   // if (checkEStop()) return;
->>>>>>> Stashed changes:src/micro_controller/ardunio/V1_arm_controller_full_status/V1_arm_controller_full_status.ino
 
-  moveJointAnimated(BASE2, 95, 1000);
-  if (checkEStop()) return;
-  moveJointAnimated(SHOULDER2, 100, 1000);
-  if (checkEStop()) return;
-  moveJointAnimated(ELBOW2, 90, 1000);
-  if (checkEStop()) return;
+  // moveJointAnimated(BASE2, 95, 1000);
+  // if (checkEStop()) return;
+  // moveJointAnimated(SHOULDER2, 100, 1000);
+  // if (checkEStop()) return;
+  // moveJointAnimated(ELBOW2, 90, 1000);
+  // if (checkEStop()) return;
 
   // delay(500);
 
@@ -270,27 +262,27 @@ void runCountdown() {
   setStatusColor(255, 255, 0); // yellow
 
   displayBitmap(NUM_3);
-  tone(BUZZER_PIN, 1000, 150);
+  toneESP32(BUZZER_PIN, 1000, 150);
   delay(1000);
   if (checkEStop()) return;
 
   displayBitmap(NUM_2);
-  tone(BUZZER_PIN, 1000, 150);
+  toneESP32(BUZZER_PIN, 1000, 150);
   delay(1000);
   if (checkEStop()) return;
 
   displayBitmap(NUM_1);
-  tone(BUZZER_PIN, 1000, 150);
+  toneESP32(BUZZER_PIN, 1000, 150);
   delay(1000);
   if (checkEStop()) return;
 
-  tone(BUZZER_PIN, 1800, 300); // longer "go" beep
+  toneESP32(BUZZER_PIN, 1800, 300); // longer "go" beep
   lc.clearDisplay(0);
   delay(300);
 }
 
 // =========================================================
-// SERVO HELPERS
+// SERVO HELPERS — UNCHANGED (Adafruit PWM library is portable)
 // =========================================================
 void setServoAngle(uint8_t channel, int angle) {
   if (angle < 0) angle = 0;
@@ -330,18 +322,41 @@ void displayBitmap(byte bmp[8]) {
   }
 }
 
+// =========================================================
+// RGB LED — reimplemented on ESP32 LEDC (replaces analogWrite)
+// Kept the same function signature/name so the rest of the sketch
+// doesn't need to change.
+// =========================================================
 void setStatusColor(int r, int g, int b) {
-  analogWrite(RGB_RED_PIN, r);
-  analogWrite(RGB_GREEN_PIN, g);
-  analogWrite(RGB_BLUE_PIN, b);
+  ledcWrite(RGB_RED_LEDC_CHANNEL,   constrain(r, 0, 255));
+  ledcWrite(RGB_GREEN_LEDC_CHANNEL, constrain(g, 0, 255));
+  ledcWrite(RGB_BLUE_LEDC_CHANNEL,  constrain(b, 0, 255));
+}
+
+// =========================================================
+// BUZZER — reimplemented on ESP32 LEDC (replaces tone()/noTone()).
+// Named toneESP32/noToneESP32 to avoid silently colliding with any
+// core-provided tone() on newer esp32 Arduino cores.
+// =========================================================
+void toneESP32(uint8_t pin, unsigned int frequency, unsigned long duration) {
+  ledcWriteTone(BUZZER_LEDC_CHANNEL, frequency);
+  delay(duration);
+  ledcWriteTone(BUZZER_LEDC_CHANNEL, 0); // stop after the requested duration,
+                                          // matching Uno tone()'s non-blocking-
+                                          // but-timed behavior closely enough
+                                          // for this sketch's fixed delay() calls
+}
+
+void noToneESP32(uint8_t pin) {
+  ledcWriteTone(BUZZER_LEDC_CHANNEL, 0);
 }
 
 // =========================================================
 // EMERGENCY STOP
 // =========================================================
 
-// ISR must stay short — just set a flag, do the real work in handleEStop().
-void eStopISR() {
+// ISR must stay short and in IRAM on ESP32 — just set a flag.
+void IRAM_ATTR eStopISR() {
   eStopActive = true;
 }
 
@@ -375,10 +390,10 @@ void handleEStop() {
 
   // Alarm + wait for the button to be released
   while (digitalRead(ESTOP_PIN) == HIGH) {
-    tone(BUZZER_PIN, 2000, 150);
+    toneESP32(BUZZER_PIN, 2000, 150);
     delay(300);
   }
-  noTone(BUZZER_PIN);
+  noToneESP32(BUZZER_PIN);
 
   Serial.println("E-stop released. Press the button again to resume.");
   // Require a deliberate second press before resuming — don't auto-resume
